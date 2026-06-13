@@ -1227,6 +1227,22 @@ class TestVmapAPI(TestCase):
     def test_vmap_autocast_cuda(self):
         self._test_vmap_autocast("cuda")
 
+    @unittest.skipIf(not torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_vmap_grad_autocast_mps(self):
+        # autocast must engage under vmap(grad) on MPS; without MPS in
+        # kKeysToPropagateToWrapper it silently no-ops and SDPA sees mixed dtypes.
+        def loss(s, q, k, v):
+            return F.scaled_dot_product_attention(q * s, k, v).float().sum()
+
+        q = torch.randn(2, 1, 4, 8, device="mps")
+        k = torch.randn(2, 1, 4, 8, device="mps")
+        v = torch.randn(2, 1, 4, 8, device="mps", dtype=torch.bfloat16)
+        s = torch.tensor(1.0, device="mps")
+        with torch.autocast("mps", torch.bfloat16):
+            out = vmap(grad(loss), in_dims=(None, 0, 0, 0))(s, q, k, v)
+        self.assertEqual(tuple(out.shape), (2,))
+        self.assertTrue(torch.isfinite(out).all())
+
     def test_restore_vmap_pytree_input_output(self):
         def f(x, y):
             output0 = x[0] + x[1]
