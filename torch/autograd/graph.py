@@ -404,12 +404,10 @@ class save_on_cpu(saved_tensors_hooks):
             if not pin_memory:
                 return (tensor.device, tensor.cpu())
             is_pinnable = device_module.is_available() and not tensor.is_sparse
-            packed = torch.empty(
-                tensor.size(),
-                dtype=tensor.dtype,
-                layout=tensor.layout,
-                pin_memory=is_pinnable,
-            )
+            # empty_like rather than empty: under vmap, tensor.size() is the
+            # unbatched shape (empty has no batch rule), so empty_like is what
+            # carries the batch dim through and keeps copy_ shapes aligned.
+            packed = torch.empty_like(tensor, device="cpu", pin_memory=is_pinnable)
             packed.copy_(tensor, non_blocking=is_pinnable)
             return (tensor.device, packed)
 
