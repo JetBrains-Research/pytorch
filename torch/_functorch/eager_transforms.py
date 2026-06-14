@@ -1510,10 +1510,15 @@ def grad_and_value_impl(
 
             flat_diff_args, spec = tree_flatten(diff_args)
 
-            # NB: need create_graph so that backward pass isn't run in no_grad mode
             flat_outputs = _as_tuple(output)
+            # Build the inner graph only if the result will be differentiated
+            # again -- by an enclosing transform (grad(grad)) or an outer
+            # autograd graph -- i.e. the output still has grad history once this
+            # level is unwrapped. Otherwise it needlessly traps checkpoint's
+            # recomputed activations. _unwrap_for_grad is a non-mutating peek.
+            create_graph = _unwrap_for_grad(output, level).requires_grad
             flat_grad_input = _autograd_grad(
-                flat_outputs, flat_diff_args, create_graph=True
+                flat_outputs, flat_diff_args, create_graph=create_graph
             )
             grad_input = tree_unflatten(flat_grad_input, spec)
 

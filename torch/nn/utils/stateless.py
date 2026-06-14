@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
 import contextlib
+import threading
 from typing import Any
 from typing_extensions import deprecated
 
@@ -9,6 +10,19 @@ from torch.nn.utils._named_member_accessor import NamedMemberAccessor
 
 
 __all__ = ["functional_call"]
+
+
+# (module, untied_parameters_and_buffers) for each reparametrization active on
+# this thread. Activation checkpoint reads this to re-apply the same swap during
+# recomputation in backward, after _reparametrize_module's context has exited.
+_reparametrize_state = threading.local()
+
+
+def _active_reparametrizations() -> list[tuple["torch.nn.Module", dict[str, Tensor]]]:
+    stack = getattr(_reparametrize_state, "stack", None)
+    if stack is None:
+        stack = _reparametrize_state.stack = []
+    return stack
 
 
 def _untie_named_tensors_map(
@@ -130,12 +144,16 @@ def _reparametrize_module(
             )
 
     orig_parameters_and_buffers: dict[str, Tensor] = {}
+    # Pushed before the swap so the pop in finally stays balanced if swap raises.
+    reparametrize_stack = _active_reparametrizations()
+    reparametrize_stack.append((module, untied_parameters_and_buffers))
     try:
         orig_parameters_and_buffers, _ = accessor.swap_tensors_dict(
             untied_parameters_and_buffers, allow_missing=True
         )
         yield
     finally:
+        reparametrize_stack.pop()
         if stack_weights:
             # When stacking is enabled, we will restore the weights in LIFO order.
             orig_parameters_and_buffers = dict(
