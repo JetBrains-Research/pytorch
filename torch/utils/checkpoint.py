@@ -1654,6 +1654,17 @@ def _checkpoint_without_reentrant_generator(
     error_on_nested_fx_trace = torch._dynamo.config.error_on_nested_fx_trace
     is_non_strict_tracing = torch.compiler._is_non_strict_tracing()
 
+    # functional_call swaps params in for the forward only and restores them on
+    # exit, but recomputation runs later in backward. Snapshot the swaps so
+    # recompute re-applies them instead of reading the restored (stale) params.
+    # Empty and inert unless functional_call wraps this region.
+    from torch.nn.utils.stateless import (
+        _active_reparametrizations,
+        _reparametrize_module,
+    )
+
+    reparametrize_snapshot = list(_active_reparametrizations())
+
     def recompute_fn(*args) -> None:
         # This will be called later during recomputation. This wrapping enables
         # the necessary global state to be captured.
@@ -1685,7 +1696,13 @@ def _checkpoint_without_reentrant_generator(
                 device_ctx,
                 nested_fx_trace_ctx,
             ):  # type: ignore[attr-defined]
-                fn(*args, **kwargs)
+                with contextlib.ExitStack() as reparametrize:
+                    # params is the already-untied map captured at forward time.
+                    for mod, params in reparametrize_snapshot:
+                        reparametrize.enter_context(
+                            _reparametrize_module(mod, params, tie_weights=False)
+                        )
+                    fn(*args, **kwargs)
 
     new_frame = _CheckpointFrame(
         recompute_fn,

@@ -79,6 +79,7 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+from torch.utils.checkpoint import checkpoint
 
 
 USE_TORCHVISION = False
@@ -3955,6 +3956,212 @@ class TestComposability(TestCase):
             vmap(grad(partial(f, offload=True)))(x),
             vmap(grad(partial(f, offload=False)))(x),
         )
+
+    _CHECKPOINT_EAGER_ONLY = (
+        "checkpoint(use_reentrant=False) with torch.func is eager only; under "
+        "torch.compile activation checkpointing is lowered to a separate HOP "
+        "that does not compose with functorch transforms"
+    )
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_grad_checkpoint_matches_no_checkpoint(self, device):
+        def fn(x):
+            return (x * x).sin()
+
+        def f(x, use_ckpt):
+            h = checkpoint(fn, x, use_reentrant=False) if use_ckpt else fn(x)
+            return (h * h).cos().sum()
+
+        x = torch.randn(8, device=device, dtype=torch.double)
+        self.assertEqual(
+            grad(partial(f, use_ckpt=True))(x),
+            grad(partial(f, use_ckpt=False))(x),
+        )
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_vmap_grad_checkpoint_matches_no_checkpoint(self, device):
+        def fn(x):
+            return (x * x).sin()
+
+        def f(x, use_ckpt):
+            h = checkpoint(fn, x, use_reentrant=False) if use_ckpt else fn(x)
+            return (h * h).cos().sum()
+
+        x = torch.randn(5, 8, device=device, dtype=torch.double)
+        self.assertEqual(
+            vmap(grad(partial(f, use_ckpt=True)))(x),
+            vmap(grad(partial(f, use_ckpt=False)))(x),
+        )
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_functional_call_checkpoint_per_sample_grads(self, device):
+        # functional_call restores the module's original parameters on exit, but
+        # checkpoint recomputes the forward later in backward; recompute must
+        # re-bind the functional parameters. Corrupt the installed parameters so
+        # any stale read diverges from the no-checkpoint reference.
+        torch.manual_seed(0)
+        net = nn.Sequential(
+            nn.Linear(8, 8, dtype=torch.double, device=device),
+            nn.Tanh(),
+            nn.Linear(8, 1, dtype=torch.double, device=device),
+        )
+        params = {k: v.detach().clone() for k, v in net.named_parameters()}
+        with torch.no_grad():
+            for p in net.parameters():
+                p.add_(123.0)
+
+        # checkpoint wraps an inner submodule; functional_call wraps the whole
+        # net, so recompute happens after the parameters are restored.
+        inner, head = net[0], net[2]
+
+        def forward(p, xi):
+            def run(xi):
+                with torch.nn.utils.stateless._reparametrize_module(net, p):
+                    return head(net[1](inner(xi))).sum()
+
+            return run(xi)
+
+        def forward_ckpt(p, xi):
+            def run(xi):
+                with torch.nn.utils.stateless._reparametrize_module(net, p):
+                    h = checkpoint(inner, xi, use_reentrant=False)
+                    return head(net[1](h)).sum()
+
+            return run(xi)
+
+        batch = torch.randn(4, 8, device=device, dtype=torch.double)
+        expected = vmap(grad(forward), in_dims=(None, 0))(params, batch)
+        got = vmap(grad(forward_ckpt), in_dims=(None, 0))(params, batch)
+        self.assertEqual(got, expected)
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_functional_call_outer_checkpoint_inner_per_sample_grads(self, device):
+        # Same race via the public torch.func.functional_call entry point, with
+        # checkpoint living inside the module's own forward.
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(8, 8, dtype=torch.double)
+
+            def forward(self, x):
+                return self.lin(x).tanh()
+
+        class Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.head = nn.Linear(8, 1, dtype=torch.double)
+
+            def forward(self, x, use_ckpt):
+                if use_ckpt:
+                    x = checkpoint(self.inner, x, use_reentrant=False)
+                else:
+                    x = self.inner(x)
+                return self.head(x).sum()
+
+        torch.manual_seed(0)
+        net = Net().to(device=device)
+        params = {k: v.detach().clone() for k, v in net.named_parameters()}
+        with torch.no_grad():
+            for p in net.parameters():
+                p.add_(123.0)
+
+        def loss(p, xi, use_ckpt):
+            return functional_call(net, p, (xi, use_ckpt))
+
+        batch = torch.randn(4, 8, device=device, dtype=torch.double)
+        expected = vmap(grad(loss), in_dims=(None, 0, None))(params, batch, False)
+        got = vmap(grad(loss), in_dims=(None, 0, None))(params, batch, True)
+        self.assertEqual(got, expected)
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_checkpoint_higher_order_transforms_raise(self, device):
+        # Higher-order over a checkpointed region must raise rather than silently
+        # miscompute (saved-tensor hooks are disabled under nested diff).
+        def f(x):
+            def g(x):
+                return (x * x).sin()
+
+            y = checkpoint(g, x, use_reentrant=False)
+            return (y * y).cos().sum()
+
+        x = torch.randn(4, device=device, dtype=torch.double)
+        t = torch.randn(4, device=device, dtype=torch.double)
+        higher_order = [
+            lambda: grad(lambda z: grad(f)(z).sum())(x),
+            lambda: jacrev(jacrev(f))(x),
+            lambda: hessian(f)(x),
+            lambda: jvp(grad(f), (x,), (t,)),
+        ]
+        for call in higher_order:
+            with self.assertRaisesRegex(RuntimeError, "saved tensor hooks"):
+                call()
+
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_grad_checkpoint_create_graph_scoping(self, device):
+        # A single first-order grad drops create_graph, so the result is not
+        # further differentiable (and checkpoint's recompute is not trapped).
+        def f(x):
+            h = checkpoint(lambda x: (x * x).sin(), x, use_reentrant=False)
+            return (h * h).sum()
+
+        x = torch.randn(8, device=device, dtype=torch.double)
+        self.assertFalse(grad(f)(x).requires_grad)
+
+    def test_grad_create_graph_preserves_outer_autograd_graph(self, device):
+        # The scoping above must not change ordinary grad: when the result
+        # connects to an enclosing autograd graph it stays differentiable and
+        # second-order is correct.
+        def f(x):
+            return (x * x * x).sum()
+
+        # (a) differentiated leaf requires grad
+        x = torch.randn(5, device=device, dtype=torch.double, requires_grad=True)
+        g = grad(f)(x)  # 3x^2
+        self.assertTrue(g.requires_grad)
+        (gg,) = torch.autograd.grad(g.sum(), x)  # 6x
+        self.assertEqual(gg, 6 * x)
+
+        # (b) the differentiated input does not require grad, but a closed-over
+        # tensor does -- the result still connects to it.
+        w = torch.randn(5, device=device, dtype=torch.double, requires_grad=True)
+        z = torch.randn(5, device=device, dtype=torch.double)
+        gz = grad(lambda z: (z * w).sum())(z)  # = w
+        self.assertTrue(gz.requires_grad)
+        (gw,) = torch.autograd.grad(gz.sum(), w)
+        self.assertEqual(gw, torch.ones_like(w))
+
+        # (c) typical functorch use with no enclosing graph: result is detached.
+        xc = torch.randn(5, device=device, dtype=torch.double)
+        self.assertFalse(grad(f)(xc).requires_grad)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "memory test requires CUDA")
+    @skipIfTorchDynamo(_CHECKPOINT_EAGER_ONLY)
+    def test_vmap_grad_checkpoint_reduces_memory(self, device):
+        if self.device_type != "cuda":
+            self.skipTest("memory test requires CUDA")
+        depth = 32
+        size = 1 << 18
+
+        def block(x):
+            return (x * x).sin().tanh()
+
+        def f(x, use_ckpt):
+            for _ in range(depth):
+                x = checkpoint(block, x, use_reentrant=False) if use_ckpt else block(x)
+            return (x * x).sum()
+
+        def peak(use_ckpt):
+            x = torch.randn(4, size, device=device)
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            vmap(grad(partial(f, use_ckpt=use_ckpt)))(x)
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated()
+
+        # If create_graph were left True the recomputed activations would be
+        # trapped and checkpoint would save nothing.
+        self.assertLess(peak(True), 0.75 * peak(False))
 
     @skipIfTorchDynamo(_SAVED_TENSOR_HOOKS_EAGER_ONLY)
     def test_jvp_supports_saved_tensor_hooks(self, device):
